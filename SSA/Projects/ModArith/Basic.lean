@@ -49,27 +49,38 @@ Here, we define a small type system for the `ModArith` dialect:
 
 You can freely add more types or rename them according to your needs.
 -/
-inductive Ty (q : ℕ) where
+inductive Ty where
 | integer
-| modLike
+| modLike (q : ℕ)
+| RNS (qs : List ℕ)
+| tensor (type : Ty) (n : ℕ)
+
 deriving DecidableEq, Repr, Inhabited
 
 /--
 We provide a `ToString` instance: this is a human-readable name for each type.
 -/
-instance {q} : ToString (Ty q) where
+instance : ToString Ty where
+  toString := toString
+where
   toString := fun
-  | .integer => "ℤ"
-  | .modLike => "!R"
+  | .integer => "int"
+  | .modLike (q : ℕ) => s!"!mod_arith.int{q}"
+  | .RNS (qs : List ℕ) => s!"!rns.rns{qs}"
+  | .tensor type n => s!"!tensor{toString type} {n}"
 
 /--
 We provide a `TyDenote` instance: this is how we translate each
 dialect type into an actual Lean type.
 -/
-instance : TyDenote (Ty q) where
-toType
-| Ty.integer => Int
-| Ty.modLike => R q  -- i.e. `ZMod q`
+instance : TyDenote Ty where
+  toType := toType
+where
+  toType := fun
+  | .integer => Int
+  | .modLike q => R q  -- i.e. `ZMod q`
+  | .RNS qs => Π i : Fin qs.length, R qs[i]  -- i.e. `RNS qs`
+  | .tensor type n => Fin n → toType type
 
 /-!
 ## Dialect operation definitions
@@ -78,25 +89,37 @@ Here are some sample operations. Adjust as appropriate for the
 `modarith` dialect: e.g. you might have add/sub/mul, an operation for
 returning constants mod q, an integer constant, etc.
 -/
-inductive Op (q : ℕ) where
-| add : Op q        -- (modLike, modLike) → modLike
-| sub : Op q        -- (modLike, modLike) → modLike
-| mul : Op q        -- (modLike, modLike) → modLike
-| const (ty : Ty q) (c : ⟦ty⟧) : Op q  -- produce a constant
+inductive Op where
+| arith.constant (ty : Ty) (c : ⟦ty⟧) : Op  -- produce a constant
+| arith.add : Op              -- (modLike, modLike) → modLike
+| arith.mul : Op              -- (modLike, modLike) → modLike
+| arith.remui : Op            -- (modLike, modLike) → modLike
+| mod_arith.encapsulate : Op  -- (modLike, modLike) → modLike
+| mod_arith.extract : Op      -- (modLike, modLike) → modLike
+| mod_arith.mod_switch : Op   -- (modLike, modLike) → modLike
+| tensor.from_elements (ty : Ty) (n : ℕ) : Op
+| mod_arith.add : Op          -- (modLike, modLike) → modLike
+| mod_arith.sub : Op          -- (modLike, modLike) → modLike
+| mod_arith.mul : Op          -- (modLike, modLike) → modLike
 
 /--
 For each operation, we specify its input `sig` (a list of
 types) and its `outTy` (the output type).
 -/
 @[simp, reducible]
-def Op.sig : Op q → List (Ty q)
-| .add            => [Ty.modLike, Ty.modLike]
-| .sub            => [Ty.modLike, Ty.modLike]
-| .mul            => [Ty.modLike, Ty.modLike]
+def Op.sig : Op → List Ty
+| .modSwitch      => [Ty.modLike q, Ty.RNS [q]]
+| .add            => [Ty.modLike q, Ty.modLike q]
+| .add            => [Ty.modLike q, Ty.modLike q]
+| .add            => [Ty.modLike q, Ty.modLike q]
+| .add            => [Ty.modLike q, Ty.modLike q]
+| .sub            => [Ty.modLike q, Ty.modLike q]
+| .mul            => [Ty.modLike q, Ty.modLike q]
+| .arith.mul      => [Ty.modLike q, Ty.modLike q]
 | .const _ _      => []
 
 @[simp, reducible]
-def Op.outTy : Op q → Ty q
+def Op.outTy : Op → Ty
 | .add         => Ty.modLike
 | .sub         => Ty.modLike
 | .mul         => Ty.modLike

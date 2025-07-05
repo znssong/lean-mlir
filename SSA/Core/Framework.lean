@@ -2780,3 +2780,53 @@ def Expr.ty : Expr d Γ eff t → d.Ty := fun _ => t
 def Expr.ctxt : Expr d Γ eff t → Ctxt d.Ty := fun _ => Γ
 
 end TypeProjections
+
+section Translate
+
+variable (d d') [DialectSignature d] [DialectSignature d']
+    [TyDenote d.Ty] [TyDenote d'.Ty] [DialectDenote d] [DialectDenote d']
+    [Monad d.m] [Monad d'.m] [LawfulMonad d.m] [LawfulMonad d'.m]
+
+class TypeTranslation (d d' : Dialect) : Type 1 where
+  translateType : d.Ty → d'.Ty
+open TypeTranslation (translateType)
+
+class Translation (d d' : Dialect) [TyDenote d.Ty] [TyDenote d'.Ty]
+    [TypeTranslation d d'] : Type 1 where
+  translate : ∀ {t : d.Ty}, ⟦t⟧ → ⟦(translateType t : d'.Ty)⟧
+open Translation (translate)
+
+variable {d} [TypeTranslation d d'] [Translation d d']
+
+def Ctxt.translate {Γ : Ctxt d.Ty} : Ctxt d'.Ty := Γ.map translateType
+
+def Ctxt.Var.translate {t} {Γ : Ctxt d.Ty} : Γ.Var t → (Γ.translate d').Var (translateType t)
+  | ⟨i, hi⟩ => ⟨i, by
+    simp only [Ctxt.get?] at hi
+    simp [Ctxt.translate, Ctxt.map, List.getElem?_map, hi]⟩
+
+def Ctxt.Valuation.translate {Γ : Ctxt d.Ty} (Γv : Valuation Γ) : Valuation (Γ.translate d') := by
+  intro t ⟨i, hi⟩
+  simp [Ctxt.translate, Ctxt.map, List.getElem?_map] at hi
+  have : i < List.length Γ := by
+    rcases hi with ⟨t', h, ⟨_⟩⟩
+    rw [List.getElem?_eq_some_iff] at h
+    exact h.1
+  have : t = translateType Γ[i] := by
+    rcases hi with ⟨t', h, ⟨_⟩⟩
+    rw [List.getElem?_eq_some_iff] at h
+    rcases h with ⟨_, ⟨_⟩⟩
+    rfl
+  cases this
+  refine Translation.translate (Γv (t := Γ[i]) ⟨i, ?_⟩)
+  rw [get?, List.getElem?_eq_some_iff]
+  exact ⟨this, rfl⟩
+
+structure TranslateRewrite {Γ : Ctxt d.Ty} {eff : EffectKind} {t : d.Ty} where
+  lhs : Com d (.ofList Γ) .pure t
+  rhs : Com d' (.ofList (Γ.map translateType)) .pure (translateType t)
+  correct : ∀ v, lhs.denote v >>= translate = rhs.denote (v.translate d')
+
+end Translate
+
+#check Com
