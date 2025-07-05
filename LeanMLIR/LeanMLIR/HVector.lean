@@ -42,7 +42,7 @@ def map' {A : α → Type*} {B : β → Type*} (f' : α → β) (f : ∀ (a : α
   | [],   .nil        => .nil
   | t::_, .cons a as  => .cons (f t a) (map' f' f as)
 
-def mapM [Monad m] {α : Type 0} {A : α → Type} {B : α → Type}
+def mapM [Monad m] {α : Type _} {A : α → Type _} {B : α → Type _}
     (f : ∀ (a : α), A a → m (B a)) :
     ∀ {l : List α}, HVector A l → m (HVector B l)
   | [], .nil => return .nil
@@ -435,5 +435,14 @@ dsimproc reduceGetN (HVector.getN (_ ::ₕ _) _ _) := fun e => do
   return .visit x
 
 end Meta
+
+def toList {α β} {as : List β} : HVector (fun _ => α) as → List α
+  | .nil => []
+  | x ::ₕ xs => x :: toList xs
+
+def fromList {α β} : (as : List β) → (xs : List α) →
+    as.length = xs.length → HVector (fun _ => α) as
+  | [], _, _ => .nil
+  | a :: as, x :: xs, h => x ::ₕ fromList as xs (by simpa using h)
 
 end HVector

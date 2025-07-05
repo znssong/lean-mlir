@@ -41,7 +41,7 @@ attribute [simp_denote]
   Com.letPure Expr.denote_castPureToEff
   Expr.denote_castPureToEff
   /- Unfold denotation -/
-  Com.ret
+  Com.denote_expand Com.ret
   Com.denote_var Com.denote_rets Expr.denoteOp HVector.denote
   Expr.op_mk Expr.args_mk Expr.regArgs_mk
   Expr.op_castPureToEff Expr.args_castPureToEff

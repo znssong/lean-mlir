@@ -202,4 +202,41 @@ def mkCom [TransformTy d φ] [TransformExpr d φ] [TransformReturn d φ]
     let com ← mkComHelper Γ coms
     return ⟨Γ, com⟩
 
+open Lean Elab
+
+class LeanExprMLIRTransformTy (d : Dialect) (φ : outParam ℕ) where
+  mkTy : Expr → MLIRType φ → Expr → TermElabM Expr
+
+class LeanExprMLIRTransformExpr (d : Dialect) (φ : outParam ℕ) where
+  mkExpr : Expr → Ctxt d.Ty → Expr → AST.Op φ → Expr → TermElabM Expr
+
+class LeanExprMLIRTransformReturn (d : Dialect) (φ : outParam ℕ) where
+  mkReturn : Expr → Ctxt d.Ty → Expr → AST.Op φ → Expr → TermElabM Expr
+
+opaque defaultMkTy {φ} (d : Dialect) [Inhabited d.Ty] :
+    MLIRType φ → ExceptM d d.Ty
+
+opaque defaultMkExpr {φ} (d : Dialect) [DialectSignature d] :
+    (Γ : Ctxt d.Ty) → (opStx : Op φ) → ReaderM d (Σ eff ty, Expr d Γ eff ty)
+
+opaque defaultMkReturn {φ} (d : Dialect) [DialectSignature d] :
+    (Γ : Ctxt d.Ty) → (opStx : Op φ) → ReaderM d (Σ eff ty, Com d Γ eff ty)
+
+opaque evalLeanExprMLIRExpr (α) [Inhabited α] : Expr → α
+
+instance (priority := low)
+    instTransformTy {d φ} [DialectSignature d] [Inhabited d.Ty] [LeanExprMLIRTransformTy d φ] :
+    TransformTy d φ where
+  mkTy := defaultMkTy d
+
+instance (priority := low)
+    instTransformExpr {d φ} [DialectSignature d] [TransformTy d φ] [LeanExprMLIRTransformExpr d φ] :
+    TransformExpr d φ where
+  mkExpr := defaultMkExpr d
+
+instance (priority := low)
+    instTransformReturn {d φ} [DialectSignature d] [TransformTy d φ] [LeanExprMLIRTransformReturn d φ] :
+    TransformReturn d φ where
+  mkReturn := defaultMkReturn d
+
 end MLIR.AST

@@ -7,93 +7,160 @@ Authors: Jaeho Choi<zerozerozero0216@gmail.com>
 import LeanMLIR.MLIRSyntax.EDSL
 import SSA.Projects.ModArith.Basic
 
-open MLIR AST Ctxt
-open ZMod
+open MLIR AST Ctxt ZMod Lean Meta Elab Qq Ty Op
+
+variable {γ₁ γ₂ γ₃}
+  [ValueMap ℕ γ₁] [DecidableEq γ₁] [Repr γ₁] [Inhabited γ₁]
+  [ValueMap ℤ γ₂] [DecidableEq γ₂] [Repr γ₂] [Inhabited γ₂]
+  [ValueMap CoprimeNats γ₃] [DecidableEq γ₃] [Repr γ₃]
 
 section MkFuns
 
-/-
-We assume `q : Nat` and `[Fact (q > 1)]` so that `ZMod q` is nontrivial.
--/
-variable {q : Nat} [Fact (q > 1)]
+syntax "!mod_arith.int<" term:max ">" : mlir_type
+syntax "!mod_arith.int<" "%" term:max ">" : mlir_type
+syntax "!rns.rns<" term:max ">" : mlir_type
+syntax "!rns.rns<" "%" term:max ">" : mlir_type
+syntax "tensor<" term:max &"x" mlir_type ">" : mlir_type
+syntax "tensor<" "%" term:max &"x" mlir_type ">" : mlir_type
 
-/--
-This function maps from an MLIR type to our `ModArith` dialect’s type.
-We support:
-  - `R` (a textual marker) → `.modLike`
-  - `int` → `.integer`
-You can rename or expand these patterns as needed.
--/
-def mkTy : MLIR.AST.MLIRType φ → MLIR.AST.ExceptM (ModArith q) (ModArith q).Ty
-  | MLIR.AST.MLIRType.undefined "R" =>
-    return .modLike
-  | MLIR.AST.MLIRType.int MLIR.AST.Signedness.Signless _ =>
-    return .integer
-  | _ => throw .unsupportedType
+open Parser.Term in
+def mkQuotedName (name : Ident) : Term :=
+  let stx := Syntax.mkNameLit ("`" ++ name.getId.toString)
+  ⟨Syntax.node1 .none ``quotedName stx⟩
 
-instance instTransformTy : MLIR.AST.TransformTy (ModArith q) 0 where
+open Macro in
+partial def stxToTerm (stx : TSyntax `mlir_type) : MacroM Term := do
+  match stx with
+  | `(mlir_type| !mod_arith.int< $q >) => `(Ty.mod_arith.int (.val $q))
+  | `(mlir_type| !mod_arith.int< %$q >) => `(Ty.mod_arith.int (.var $q))
+  | `(mlir_type| !rns.rns< $qs >) => `(Ty.rns.rns (.val ⟨$qs, by decide⟩))
+  | `(mlir_type| !rns.rns< %$qs >) => `(Ty.rns.rns (.var $qs))
+  | `(mlir_type| tensor< $n x $t >) => `(Ty.tensor $n $(← stxToTerm t))
+  | `(mlir_type| tensor< %$n x $t >) => `(Ty.tensor (.var $n) $(← stxToTerm t))
+  | t =>
+    let t' ← expandMacros (← `([mlir_type| $t]))
+    match t' with
+    | `(MLIRType.int $_ $_) => `(Ty.int)
+    | `(MLIRType.index) => `(Ty.index)
+    | _ => Macro.throwUnsupported
+
+open Term in
+@[term_elab MLIR.EDSL.«term[mlir_type|_]»]
+def expandType : TermElab := fun stx ty? => do
+  let fn := fun
+    | `([mlir_type| $t]) => do
+      `(MLIR.AST.MLIRType.expr quoted($(← liftMacroM <| stxToTerm t)))
+    | e => return e
+  adaptExpander fn stx ty?
+
+def getValueMap (t : Q(Type)) :
+    MetaM (Σ γ : Q(Type), Q(ValueMap $t $γ) × Q(DecidableEq $γ)) := do
+  let γ : Q(Type) ← mkFreshExprMVar none
+  let _inst : Q(ValueMap $t $γ) ← synthInstance q(ValueMap $t $γ)
+  let _inst₂ : Q(DecidableEq $γ) ← synthInstance q(DecidableEq $γ)
+  return ⟨← instantiateMVars γ, _inst, _inst₂⟩
+
+def mkTy (_ : Expr) (ty : MLIRType 0) (_ : Expr) : TermElabM Expr := do
+  let ⟨_, _, _⟩ ← getValueMap q(ℕ)
+  let ⟨_, _, _⟩ ← getValueMap q(ℤ)
+  let ⟨_, _, _⟩ ← getValueMap q(CoprimeNats)
+  show TermElabM Q(ExceptM ModArith ModArith.Ty) from
+  match ty with
+  | .int _ _ => return q(.ok .int)
+  | .index => return q(.ok .index)
+  | .expr (e : Q(ModArith.Ty)) => return q(.ok $e)
+  | _ => throwError "Unsupported type"
+
+instance : LeanExprMLIRTransformTy ModArith 0 where
   mkTy := mkTy
 
 /--
 A helper to construct a constant integer expression (in Lean’s sense of “plain Int”).
 -/
-def cstInt {Γ : Ctxt _} (z : Int) : Expr (ModArith q) Γ .pure .integer :=
+def cstInt {Γ : Ctxt _} (z : ℤ%) : Expr ModArith Γ .pure [int] :=
   Expr.mk
-    (op      := .const Ty.integer z)
+    (op      := arith.constant z)
     (ty_eq   := rfl)
     (eff_le  := by constructor)
     (args    := .nil)
     (regArgs := .nil)
 
-/--
-A helper to construct a ring element in `ZMod q` from an `Int`.
--/
-def cstMod {Γ : Ctxt _} (z : Int) : Expr (ModArith q) Γ .pure .modLike :=
-  -- If you want a “computable cast” approach, do similarly to FHE's `cstComputable`.
-  -- For now, we can just do a raw `.const` to embed `↑z : ZMod q`.
-  let zmod : ZMod q := z
+def cstIndex {Γ : Ctxt _} (z : ℕ%) : Expr ModArith Γ .pure [index] :=
   Expr.mk
-    (op      := .const Ty.modLike zmod)
+    (op      := index.constant z)
     (ty_eq   := rfl)
     (eff_le  := by constructor)
     (args    := .nil)
     (regArgs := .nil)
 
-/--
-Build an “add” operation in `ZMod q`.
--/
-def add {Γ : Ctxt (Ty q)} (x y : Var Γ .modLike)
-    : Expr (ModArith q) Γ .pure .modLike :=
-  Expr.mk
-    (op      := .add)
-    (ty_eq   := rfl)
-    (eff_le  := by constructor)
-    (args    := .cons x (.cons y .nil))
-    (regArgs := .nil)
+macro "build_modarith_op" name:ident op:term:max : command => `(command |
+  def $name {Γ : Ctxt Ty} (q : ℕ%) (x y : Var Γ (mod_arith.int q)) :
+      Expr ModArith Γ .pure [mod_arith.int q] :=
+    Expr.mk
+      (op      := $op q)
+      (ty_eq   := rfl)
+      (eff_le  := by constructor)
+      (args    := [x, y]ₕ)
+      (regArgs := []ₕ))
 
-/--
-Build a “sub” operation in `ZMod q`.
--/
-def sub {Γ : Ctxt (Ty q)} (x y : Var Γ .modLike)
-    : Expr (ModArith q) Γ .pure .modLike :=
-  Expr.mk
-    (op      := .sub)
-    (ty_eq   := rfl)
-    (eff_le  := by constructor)
-    (args    := .cons x (.cons y .nil))
-    (regArgs := .nil)
+macro "build_arith_op" name:ident op:term:max : command => `(command |
+  def $name {Γ : Ctxt Ty} (x y : Var Γ int) :
+      Expr ModArith Γ .pure [int] :=
+    Expr.mk
+      (op      := $op)
+      (ty_eq   := rfl)
+      (eff_le  := by constructor)
+      (args    := [x, y]ₕ)
+      (regArgs := []ₕ))
 
-/--
-Build a “mul” operation in `ZMod q`.
--/
-def mul {Γ : Ctxt (Ty q)} (x y : Var Γ .modLike)
-    : Expr (ModArith q) Γ .pure .modLike :=
-  Expr.mk
-    (op      := .mul)
-    (ty_eq   := rfl)
-    (eff_le  := by constructor)
-    (args    := .cons x (.cons y .nil))
-    (regArgs := .nil)
+build_modarith_op mod_add mod_arith.add
+build_modarith_op mod_sub mod_arith.sub
+build_modarith_op mod_mul mod_arith.mul
+build_arith_op add arith.add
+build_arith_op sub arith.sub
+build_arith_op mul arith.mul
+build_arith_op remui arith.remui
+
+def getValueInfoBinaryOp (Γ : Ctxt ModArith.Ty) (opStx : Op 0) :
+    ReaderM ModArith <|
+      ModArith.Ty × (s : ModArith.Ty) × (t : ModArith.Ty) ×
+      Γ.Var s × Γ.Var t := do
+  let [xStx, yStx] := opStx.args
+    | throw <| .generic s!"{opStx.name} expects exactly 2 args, got {opStx.args.length}"
+  let [resStx] := opStx.res
+    | throw <| .generic s!"{opStx.name} returns exactly 1 args, got {opStx.args.length}"
+  let ⟨tyX, x⟩ ← TypedSSAVal.mkVal Γ xStx
+  let ⟨tyY, y⟩ ← TypedSSAVal.mkVal Γ yStx
+  let tyRes : ModArith.Ty ← TypedSSAVal.mkTy resStx
+  return ⟨tyRes, tyX, tyY, x, y⟩
+
+def getValueInfoUnaryOp (Γ : Ctxt ModArith.Ty) (opStx : Op 0) :
+    ReaderM ModArith <|
+      ModArith.Ty × (t : ModArith.Ty) × Γ.Var t := do
+  let [xStx] := opStx.args
+    | throw <| .generic s!"{opStx.name} expects exactly 1 args, got {opStx.args.length}"
+  let [resStx] := opStx.res
+    | throw <| .generic s!"{opStx.name} returns exactly 1 args, got {opStx.args.length}"
+  let ⟨tyX, x⟩ ← TypedSSAVal.mkVal Γ xStx
+  let tyRes : ModArith.Ty ← TypedSSAVal.mkTy resStx
+  return ⟨tyRes, tyX, x⟩
+
+def mkModArith (Γ : Ctxt ModArith.Ty) (opStx : Op 0)
+    (mk : ∀ {Γ : Ctxt Ty} (q : ℕ%) (_ _ : Var Γ (mod_arith.int q)),
+      Expr ModArith Γ .pure [mod_arith.int q]) :
+    ReaderM ModArith (Σ eff ty, Expr ModArith Γ eff ty):= do
+  let ⟨_, mod_arith.int q, mod_arith.int q', x, y⟩ ← getValueInfoBinaryOp Γ opStx
+    | throw <| .generic s!"expected both operands to be of type '!mod_arith.int'"
+  let .isTrue (.refl _) := decEq q q'
+    | throw <| .generic s!"expected both modulus to be the same"
+  return ⟨.pure, [mod_arith.int q], mk q x y⟩
+
+def mkArith (Γ : Ctxt ModArith.Ty) (opStx : Op 0)
+    (mk : ∀ {Γ : Ctxt Ty} (_ _ : Var Γ int), Expr ModArith Γ .pure [int]) :
+    ReaderM ModArith (Σ eff ty, Expr ModArith Γ eff ty):= do
+  let ⟨_, int, int, x, y⟩ ← getValueInfoBinaryOp Γ opStx
+    | throw <| .generic s!"expected both operands to be of type 'int'"
+  return ⟨.pure, [int], mk x y⟩
 
 /--
 Given a single MLIR operation, produce a Lean expression in the `ModArith` dialect.
@@ -102,122 +169,119 @@ We match on `opStx.name` to see if it is `"mod_arith.add"`, `"mod_arith.sub"`,
 `"arith.const"`, etc. Then we decode the arguments, attribute `value`,
 and produce the corresponding expression builder (add, sub, cstInt, etc.).
 -/
-def mkExpr (Γ : Ctxt (ModArith q).Ty) (opStx : MLIR.AST.Op 0)
-  : MLIR.AST.ReaderM (ModArith q) (Σ eff ty, Expr (ModArith q) Γ eff ty) := do
+def mkExpr (Γ : Ctxt ModArith.Ty) (opStx : Op 0) :
+    ReaderM ModArith (Σ eff ty, Expr ModArith Γ eff ty) := do
   match opStx.name with
-
-  | "mod_arith.add" =>
-    match opStx.args with
-    | [xStx, yStx] => do
-      let ⟨tyX, x⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ xStx
-      let ⟨tyY, y⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ yStx
-      match tyX, tyY with
-      | .modLike, .modLike =>
-         return ⟨.pure, .modLike, add x y⟩
-      | _, _ =>
-         throw <| .generic s!"expected both operands to be of type 'modLike'"
-    | _ =>
-      throw <| .generic s!"mod_arith.add expects exactly 2 args, got {opStx.args.length}"
-
-  | "mod_arith.sub" =>
-    match opStx.args with
-    | [xStx, yStx] => do
-      let ⟨tyX, x⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ xStx
-      let ⟨tyY, y⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ yStx
-      match tyX, tyY with
-      | .modLike, .modLike =>
-         return ⟨.pure, .modLike, sub x y⟩
-      | _, _ =>
-         throw <| .generic s!"expected both operands to be of type 'modLike'"
-    | _ =>
-      throw <| .generic s!"mod_arith.sub expects exactly 2 args, got {opStx.args.length}"
-
-  | "mod_arith.mul" =>
-    match opStx.args with
-    | [xStx, yStx] => do
-      let ⟨tyX, x⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ xStx
-      let ⟨tyY, y⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ yStx
-      match tyX, tyY with
-      | .modLike, .modLike =>
-         return ⟨.pure, .modLike, mul x y⟩
-      | _, _ =>
-         throw <| .generic s!"expected both operands to be of type 'modLike'"
-    | _ =>
-      throw <| .generic s!"mod_arith.mul expects exactly 2 args, got {opStx.args.length}"
-
   | "arith.constant" =>
-    -- We let the `arith.constant` produce either a plain integer or an index, etc.
-    match opStx.attrs.find_int "value" with
-    | .some (val, valTy) =>
-      match valTy with
-      | .int _sz _sign =>
-        -- check result type from `opStx.res`
-        match opStx.res with
-        | [(_, MLIR.AST.MLIRType.int .Signless _sz2)] =>
-          -- produce cstInt
-          return ⟨.pure, .integer, cstInt val⟩
-        | other =>
-          throw <| .generic s!"arith.constant: unsupported result type {repr other}"
-      | tyOther =>
-        throw <| .generic s!"arith.constant with unsupported type {repr tyOther}"
-    | .none =>
-      throw <| .generic s!"arith.constant expects int-attr 'value', got {repr opStx.attrs}"
-
-  | "mod_arith.constant" =>
-    -- A direct constant in `ZMod q`.
-    match opStx.attrs.find_int "value" with
-    | .some (val, _valTy) =>
-      return ⟨.pure, .modLike, cstMod val⟩
-    | .none =>
-      throw <| .generic s!"mod_arith.constant expects int-attr 'value', got {repr opStx.attrs}"
-
-  | other =>
-    throw <| .unsupportedOp s!"[mod_arith] mkExpr: operation name {other} not recognized"
+    match opStx.res with
+    | [(_, MLIRType.int .Signless _)] =>
+      match opStx.attrs.find "value" with
+      | .some (.int x _) => return ⟨.pure, [int], cstInt (.val x)⟩
+      | .some (.expr e) => return ⟨.pure, [int], cstInt (.var (evalLeanExprMLIRExpr γ₂ e))⟩
+      | ret => throw <| .generic <|
+        s!"arith.constant expects integer typed attribute 'value', got {repr opStx.attrs}"
+    | other => throw <| .generic s!"arith.constant: unsupported result type {repr other}"
+  | "arith.add" => mkArith Γ opStx add
+  | "arith.sub" => mkArith Γ opStx sub
+  | "arith.mul" => mkArith Γ opStx mul
+  | "arith.remui" => mkArith Γ opStx remui
+  | "index.constant" =>
+    match opStx.res with
+    | [(_, MLIRType.int .Signless _)] =>
+      match opStx.attrs.find "value" with
+      | .some (.int x _) => return ⟨.pure, [index], cstIndex (.val x.toNat)⟩
+      | .some (.expr e) => return ⟨.pure, [index], cstIndex (.var (evalLeanExprMLIRExpr γ₁ e))⟩
+      | ret => throw <| .generic <|
+        s!"index.constant expects natural number typed attribute 'value', got {repr opStx.attrs}"
+    | other => throw <| .generic s!"index.constant: unsupported result type {repr other}"
+  | "mod_arith.add" => mkModArith Γ opStx mod_add
+  | "mod_arith.sub" => mkModArith Γ opStx mod_sub
+  | "mod_arith.mul" => mkModArith Γ opStx mod_mul
+  | "mod_arith.encapsulate" =>
+    let ⟨mod_arith.int q, int, x⟩ ← getValueInfoUnaryOp Γ opStx
+      | throw <| .generic <|
+        s!"expected the operand to be of type `int` and the result to be of type `mod_arith.int _`"
+    return ⟨.pure, [mod_arith.int q], Expr.mk
+      (op      := mod_arith.encapsulate q)
+      (ty_eq   := rfl)
+      (eff_le  := by constructor)
+      (args    := [x]ₕ)
+      (regArgs := []ₕ)⟩
+  | "mod_arith.mod_switch" =>
+    match ← getValueInfoUnaryOp Γ opStx with
+    | ⟨rns.rns qs, mod_arith.int q, x⟩ =>
+      return ⟨.pure, [rns.rns qs], Expr.mk
+        (op      := mod_arith.mod_switch.decompose qs q)
+        (ty_eq   := rfl)
+        (eff_le  := by constructor)
+        (args    := [x]ₕ)
+        (regArgs := []ₕ)⟩
+    | ⟨mod_arith.int q, rns.rns qs, x⟩ =>
+      return ⟨.pure, [mod_arith.int q], Expr.mk
+        (op      := mod_arith.mod_switch.interpolate q qs)
+        (ty_eq   := rfl)
+        (eff_le  := by constructor)
+        (args    := [x]ₕ)
+        (regArgs := []ₕ)⟩
+    | _ => throw <| .generic <|
+        s!"expected exactly one of the operand and the result to be of type `rns.rns _` and " ++
+        s!"the another be of type `mod_arith.int _`"
+  | "tensor.extract" =>
+    let ⟨t, .tensor n t', .index, x, y⟩ ← getValueInfoBinaryOp Γ opStx
+      | throw <| .generic <| s!"Invalid `tensor.extract` operation"
+    let .isTrue (.refl _) := decEq t t'
+      | throw <| .generic s!"The return type and the type of tensor elements must be same"
+    return ⟨.pure, [t], Expr.mk
+      (op      := tensor.extract t n)
+      (ty_eq   := rfl)
+      (eff_le  := by constructor)
+      (args    := [x, y]ₕ)
+      (regArgs := []ₕ)⟩
+  | other => throw <| .unsupportedOp <|
+    s!"[mod_arith] mkExpr: operation name {other} not recognized"
 
 /--
 Given a return statement, produce a `Com (ModArith q)` that returns the given value.
 We check that the op is named "return" and has exactly one argument.
 -/
-def mkReturn (Γ : Ctxt (ModArith q).Ty) (opStx : MLIR.AST.Op 0)
-  : MLIR.AST.ReaderM (ModArith q) (Σ eff ty, Com (ModArith q) Γ eff ty) :=
+def mkReturn (Γ : Ctxt ModArith.Ty) (opStx : Op 0) :
+    ReaderM ModArith (Σ eff ty, Com ModArith Γ eff ty) :=
   if opStx.name == "return" then
     match opStx.args with
     | [argStx] => do
-      let ⟨tyArg, x⟩ ← MLIR.AST.TypedSSAVal.mkVal Γ argStx
-      return ⟨.pure, tyArg, Com.ret x⟩
+      let ⟨tyArg, x⟩ ← TypedSSAVal.mkVal Γ argStx
+      return ⟨.pure, [tyArg], Com.ret x⟩
     | _ =>
       throw <| .generic s!"[mod_arith] return expects exactly 1 argument"
   else
       throw <| .generic s!"[mod_arith] mkReturn called on non-return op {opStx.name}"
 
-
-instance : MLIR.AST.TransformExpr (ModArith q) 0 where
+instance : TransformExpr ModArith 0 where
   mkExpr := mkExpr
 
-instance : MLIR.AST.TransformReturn (ModArith q) 0 where
+instance : TransformReturn ModArith 0 where
   mkReturn := mkReturn
 
 end MkFuns
 
-open Qq MLIR AST Lean Elab Term Meta in
-elab "[mod_arith " qi:term "," hq:term " | " reg:mlir_region "]" : term => do
-  -- 1) elaborate `q : Nat`
-  let q_   : Q(Nat)             ← elabTermEnsuringTypeQ qi   q(Nat)
-  -- 2) elaborate `hq : Fact (q > 1)`
-  let hq_  : Q(Fact ($q_ > 1))  ← elabTermEnsuringTypeQ hq   q(Fact ($q_ > 1))
-  -- 3) call the EDSL machinery
-  SSA.elabIntoCom reg q(ModArith $q_)
+elab "[mod_arith " " | " reg:mlir_region "]" : term => do
+  let ⟨γ₁, _, _⟩ ← getValueMap q(ℕ)
+  let ⟨γ₂, _, _⟩ ← getValueMap q(ℤ)
+  let ⟨γ₃, _, _⟩ ← getValueMap q(CoprimeNats)
+  let _inst : Q(Repr $γ₁) ← synthInstance q(Repr $γ₁)
+  let _inst : Q(Inhabited $γ₁) ← synthInstance q(Inhabited $γ₁)
+  let _inst : Q(Repr $γ₂) ← synthInstance q(Repr $γ₂)
+  let _inst : Q(Inhabited $γ₂) ← synthInstance q(Inhabited $γ₂)
+  let _inst : Q(Repr $γ₃) ← synthInstance q(Repr $γ₃)
+  SSA.elabIntoCom reg q(ModArith)
 
-/-!
-Usage example might look like:
-
-```lean
-def myTest : Com (ModArith 17) [] .pure .modLike :=
-  [mod_arith 17, fact17 |
-    %x = arith.constant 42 : !i32 { value = 42 : i32 }
-    %y = mod_arith.const { value = 9 : i64 } : !R
-    %z = mod_arith.add %x, %y : !R
-    return %z
-  ]
-```
--/
+elab "%[mod_arith " " | " reg:mlir_region "]" : term => do
+  let ⟨γ₁, _, _⟩ ← getValueMap q(ℕ)
+  let ⟨γ₂, _, _⟩ ← getValueMap q(ℤ)
+  let ⟨γ₃, _, _⟩ ← getValueMap q(CoprimeNats)
+  let _inst : Q(Repr $γ₁) ← synthInstance q(Repr $γ₁)
+  let _inst : Q(Inhabited $γ₁) ← synthInstance q(Inhabited $γ₁)
+  let _inst : Q(Repr $γ₂) ← synthInstance q(Repr $γ₂)
+  let _inst : Q(Inhabited $γ₂) ← synthInstance q(Inhabited $γ₂)
+  let _inst : Q(Repr $γ₃) ← synthInstance q(Repr $γ₃)
+  SSA.elabIntoComExtended reg q(ModArith)

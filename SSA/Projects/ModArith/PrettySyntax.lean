@@ -23,41 +23,66 @@ as uniform ops. This means we can write lines like:
 
 and the `PrettyEDSL` machinery will parse them automatically.
 -/
-syntax "mod_arith.constant" : MLIR.Pretty.uniform_op
 syntax "mod_arith.add" : MLIR.Pretty.uniform_op
 syntax "mod_arith.sub" : MLIR.Pretty.uniform_op
 syntax "mod_arith.mul" : MLIR.Pretty.uniform_op
+syntax "arith.add" : MLIR.Pretty.uniform_op
+syntax "arith.sub" : MLIR.Pretty.uniform_op
+syntax "arith.mul" : MLIR.Pretty.uniform_op
+syntax "arith.remui" : MLIR.Pretty.uniform_op
 syntax "return" : MLIR.Pretty.uniform_op
 
 /--
 We handle two forms:
 
-  1) `%v = mod_arith.constant 42 : !Zp`
+  1) `%v = arith.constant 42 : !int`
      which gets parsed as an integer attribute with value 42
 
-  2) `%v = mod_arith.constant -10 : !Zp`
+  2) `%v = arith.constant -10 : !int`
      for negative numbers
 
 For each, we produce a uniform op in the underlying IR:
 
-  `%v = "mod_arith.constant" () {value = 42} : () -> (!Zp)`
+  `%v = "arith.constant" () {value = 42} : () -> (!Zp)`
 -/
-syntax mlir_op_operand " = " "mod_arith.constant" "$" noWs "{" term "}" " : " mlir_type : mlir_op
-syntax mlir_op_operand " = " "mod_arith.constant" neg_num " : " mlir_type : mlir_op
+
+syntax mlir_op_operand " = " "arith.constant" neg_num " : " mlir_type : mlir_op
+syntax mlir_op_operand " = " "arith.constant" "%" term:max " : " mlir_type : mlir_op
+syntax mlir_op_operand " = " "index.constant" num " : " mlir_type : mlir_op
+syntax mlir_op_operand " = " "index.constant" "%" term:max " : " mlir_type : mlir_op
+syntax mlir_op_operand " = " "mod_arith.encapsulate" mlir_op_operand " : " mlir_type " -> " mlir_type : mlir_op
+syntax mlir_op_operand " = " "mod_arith.mod_switch" mlir_op_operand " : " mlir_type &" to " mlir_type : mlir_op
+syntax mlir_op_operand " = " "tensor.extract" mlir_op_operand "[" mlir_op_operand "]" " : " mlir_type " -> " mlir_type : mlir_op
 
 macro_rules
-  -- Case (2): negative integer literal
-  | `(mlir_op| $v:mlir_op_operand = mod_arith.constant $x:neg_num : $t) =>
-    `(mlir_op| $v:mlir_op_operand = "mod_arith.constant" () {value = $x:neg_num} : () -> ($t))
-
-  -- Case (1): arbitrary integer expression in braces
-  | `(mlir_op| $v:mlir_op_operand = mod_arith.constant ${ $x:term } : $t) => do
-      let ctor := mkIdent ``MLIR.AST.AttrValue.int
-      let x ← `($ctor $x [mlir_type| i64])
-      `(mlir_op| $v:mlir_op_operand = "mod_arith.constant" () {value = $$($x)} : () -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = arith.constant $x:neg_num : $t) =>
+    `(mlir_op| $v:mlir_op_operand = "arith.constant" () {value = $x:neg_num} : () -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = arith.constant %$x:term : $t) =>
+    `(mlir_op| $v:mlir_op_operand = "arith.constant" () {value = mlir_attr_quoted($x, TheIndex ℤ)} : () -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = index.constant $x:num : $t) =>
+    `(mlir_op| $v:mlir_op_operand = "index.constant" () {value = $x:num} : () -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = index.constant %$x:term : $t) =>
+    `(mlir_op| $v:mlir_op_operand = "index.constant" () {value = mlir_attr_quoted($x, TheIndex ℕ)} : () -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = mod_arith.encapsulate $x : $s -> $t) =>
+    `(mlir_op| $v:mlir_op_operand = "mod_arith.encapsulate" ($x) : ($s) -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = mod_arith.mod_switch $x : $s to $t) =>
+    `(mlir_op| $v:mlir_op_operand = "mod_arith.mod_switch" ($x) : ($s) -> ($t))
+  | `(mlir_op| $v:mlir_op_operand = tensor.extract $x[$i] : $s -> $t) =>
+    `(mlir_op| $v:mlir_op_operand = "tensor.extract" ($x, $i) : ($s, index) -> ($t))
 
 section Test
-variable {q : Nat} [h : Fact (q > 1)]
+
+local instance : ValueMap ℕ Name := { map := fun _ => default }
+local instance : ValueMap ℤ Name := { map := fun _ => default }
+local instance : ValueMap CoprimeNats Name := { map := fun _ => default }
+
+private def test := [mod_arith | {
+  ^bb0(%a : i64, %b : !mod_arith.int<%`n>) :
+    %c = arith.constant 3 : i64
+    %d = arith.mul %a, %c : i64
+    return %d : i64
+}]
+
 /--
 A small test snippet. If you do:
 
@@ -70,16 +95,18 @@ It shows how Lean parses:
   %add = mod_arith.add %e1, %e2 : !R
   return %add : !R
 -/
-private def test_lhs := [mod_arith q, h | {
-  ^bb0(%a : !R):
-    %e1 = mod_arith.constant 12 : !R
-    %e2 = mod_arith.constant -5 : !R
-    %add = mod_arith.add %e1, %e2 : !R
-    return %a : !R
+private def test_lhs := %[mod_arith | {
+  ^bb0(%a : !mod_arith.int<%`n>, %b : !rns.rns<[3, 5]>):
+    %e1 = arith.constant 12 : i64
+    %e2 = [test] %e1, %a : (i64, !mod_arith.int<%`n>) -> i64
+    %e3 = arith.mul %e1, %e2 : i64
+    return %e3 : i64
 }]
 
 /--
-info: '_private.SSA.Projects.ModArith.PrettySyntax.0.MLIR.EDSL.Pretty.test_lhs' depends on axioms: [propext, Quot.sound]
+info: '_private.SSA.Projects.ModArith.PrettySyntax.0.MLIR.EDSL.Pretty.test_lhs' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
 -/
 #guard_msgs in #print axioms test_lhs
 

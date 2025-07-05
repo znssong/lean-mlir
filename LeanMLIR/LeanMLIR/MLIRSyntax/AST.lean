@@ -64,8 +64,10 @@ inductive MLIRType (φ : Nat) : Type _ where
   | tensor2d: MLIRType φ -- tensor of int values.
   | tensor4d: MLIRType φ -- tensor of int values.
   | index:  MLIRType φ
+  | syntax : Syntax → MLIRType φ
+  | expr : Expr → MLIRType φ
   | undefined: String → MLIRType φ
-  deriving Repr, DecidableEq
+  deriving Repr
 
 variable (φ : Nat)
 
@@ -102,6 +104,8 @@ inductive AttrValue where
   | dict: AttrDict -> AttrValue
   | opaque_: (dialect: String) -> (value: String) -> AttrValue
   | opaqueElements: (dialect: String) -> (value: String) -> (type: MLIRType φ) -> AttrValue
+  | syntax : Syntax -> AttrValue
+  | expr : Expr -> AttrValue
   | unit: AttrValue
 
 -- https://mlir.llvm.org/docs/LangRef/#attributes
@@ -221,6 +225,8 @@ partial def docAttrVal {φ} : AttrValue φ → Format
   | .dict d => docAttrDict d
   | .opaque_ dialect val => f!"#${dialect}<${val}>"
   | .opaqueElements dialect val ty => f!"#opaque< {dialect}, #{val}> : #{repr ty}"
+  | .syntax stx => f!"{stx}"
+  | .expr e => f!"{e}"
   | .unit => "()"
 
 partial def docAttrEntry {φ} : AttrEntry φ → Format
